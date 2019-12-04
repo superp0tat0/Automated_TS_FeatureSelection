@@ -1,0 +1,382 @@
+---
+title: "D57 Project Intergrated"
+output: html_notebook
+---
+Choose to solve Problem 1.
+
+```{r,warning=FALSE,message=FALSE,include=FALSE}
+# install.packages("cansim")
+# install.packages("tidyverse")
+# install.packages("lubridate")
+# install.packages("astsa")
+# install.packages("forecast")
+# install.packages("fpp")
+# install.packages("ggplot2")
+# install.packages("MASS")
+# install.packages("dplyr")
+
+# load required packages
+library(cansim)
+library(tidyverse)
+library(lubridate)
+library(astsa)
+library(forecast)
+library(fpp);
+library(ggplot2);
+library(MASS);
+library(dplyr);
+```
+
+=============================== Part2: Core Model ===============================
+```{r}
+sep <- function(){
+    print("----------------------------------------------------------------------------------")
+}
+
+#This function will first fit the ARIMA model without external x, then use its residuals to do a linear regression with the external resources, and find out which external resources will be the best external resources
+# external is given in the form of a list of external regressors names
+#data -> data contain y and x
+#external -> a list of external regressors names
+#df -> if the original model contain a drift parameter, set it to true.
+# > auto_external(Oil, c("MP","LP","CI","CP", "LI")) -> "CP" "CI" LI"
+
+auto_external <- function(data, external, df=FALSE){
+    #Auto arima
+    auto_arima <- auto.arima(data$Deflator)
+    summary(auto_arima)
+    if(df){ #use differenced x to fit residual
+      data2 <- data.frame("residual" = auto_arima$residual[2:55])
+      data2[external] = diff(data.matrix(data[external]),1)
+      fmla <- as.formula(paste("residual ~ ", paste(external, collapse= "+")))
+      fit <- lm(fmla,data=data2);
+    }else{ #use x to fit residual
+      data$residual <- auto_arima$residual
+      fmla <- as.formula(paste("residual ~ ", paste(external, collapse= "+")))
+      fit <- lm(fmla,data=data);
+    }
+    step <- stepAIC(fit, direction="both",trace=FALSE);
+    valid_ext <- attr(terms(step), "term.labels");
+    sep();
+    print(valid_ext)
+    sep();
+}
+
+#This function will first fit the model using the linear regression, then use stepAIC to select the best model.
+#The parameters it return will from the best model
+#data -> data contain y and x
+#external -> a list of external regressors names
+#df -> if the original model contain a drift parameter, set it to true.
+# > auto_external(Oil, c("MP","LP","CI","CP", "LI")) -> "CP" "CI" LI"
+
+auto_external_lm <- function(data, external, df = FALSE){
+    if(df){ #use differenced x to fit differenced y
+      data2 <- data.frame("Deflator" = diff(data$Deflator,1))
+      data2[external] = diff(data.matrix(data[external]),1)
+      
+      fmla <- as.formula(paste("Deflator ~ ", paste(external, collapse= "+")))
+      fit <- lm(fmla, data2)
+      step <- stepAIC(fit, direction="both", trace = FALSE)
+    }else{ #use normal x to fit normal y
+      fmla <- as.formula(paste("Deflator ~ ", paste(external, collapse= "+")))
+      fit <- lm(fmla, data)
+      step <- stepAIC(fit, direction="both", trace = FALSE)
+    }
+    sep();
+    print(attr(terms(step), "term.labels"))
+    sep();
+}
+
+#This function is a helper function for tsCV, it forecast y+h given y and external resources
+
+#Warning: The arima parameter cannot be set before, it will use auto.arima to find the best model in every lag. The function could only be used to assess the efficiency of external resources, to assess the model performance, see function below.
+#y - data for prediction, length(y) < length(xreg)
+#xreg - full vectors of external information
+#h - time lag need for forecast, will ignore given external information
+
+fc <- function(y, h=1, xreg = NULL)
+{
+  if(is.null(xreg)){
+    #predict
+    fit <- auto.arima(y)
+    return(forecast(fit, h=h))
+  }else{
+    ncol <- NCOL(xreg)
+    x_train <- matrix(xreg[1:length(y), ], ncol = ncol)
+    if(NROW(xreg) < length(y) + 1)
+      stop("Not enough xreg data for forecasting")
+    x_predict <- matrix(xreg[length(y) + (1:1), ], ncol = ncol)
+    fit <- auto.arima(y, xreg=x_train)
+    forecast(fit, xreg = x_predict, h = 1)
+  }
+}
+
+#This function will use cross validation to assess the model accuracy, it predict Y_t+1 based on X_t time series and the external resources.
+#Choose ARIMA method to be Maximum likelihood since the default will encounter error :non-stationary AR part from CSS. This method is slower but gives better estimates and always returns a stationary model.
+#y -> observed values
+#xreg -> external resources
+#nm -> nm-nd power of the error
+#param -> model parameters
+
+tsCV_param <- function(y, param, xreg = NULL, nm = 2){
+  MSPE = c()
+  MAPE = c()
+  nCol <- NCOL(xreg)
+    for(i in c(nCol+param[1]+1):(length(y)-2)){
+      if(is.null(xreg)){
+        fit <- Arima(y[1:i], order = param, method="ML")
+        prediction <- predict(fit, h = 1)
+      } #without regressor
+      else{
+        fit <- Arima(y[1:i], order = param, xreg = xreg[1:i,], method="ML")
+        prediction <- predict(fit, newxreg = matrix(xreg[i+1,],ncol = nCol))
+        }  #With regressor
+      
+      MSPE = c(MSPE, (y[i+1] - as.numeric(prediction$pred))^nm)
+      MAPE = c(MAPE, abs((y[i+1] - as.numeric(prediction$pred))/abs(y[i+1])))
+    }
+  return( c( mean(MSPE, na.rm = TRUE),mean(MAPE, na.rm = TRUE) ) )
+}
+
+get_external <- function(sector){
+  result <- cbind(sector$CC, sector$Ccost, sector$CI, sector$CP, sector$CSI,
+                                              sector$LCE, sector$LCO, sector$LI, sector$LP, sector$MP)
+  return(result)
+}
+
+get_error <- function(error, real, nm=2){
+  MSPE = c()
+  MAPE = c()
+  for(i in c(1:length(real))){
+    if(is.na(error[i]) == FALSE && is.na(real[i]) == FALSE){
+      MSPE = c(MSPE, error[i]^nm)
+      MAPE = c(MAPE, abs(error[i])/abs(real[i]) )
+    }
+  }
+  return( c( mean(MSPE, na.rm = TRUE),mean(MAPE, na.rm = TRUE) ) )
+}
+```
+
+=============================== Part2 Step 2: Fitting the MOGE sector ===============================
+```{r,warning=FALSE,message=FALSE,include=FALSE}
+#Examples for MOGE industry
+Oil = get_cansim_vector( c( 
+  "Real" = "v86718747",
+  "Nominal" = "v86719269",
+  "MP" = "v41712883", #Market productivity  for Oil industry* (same as following)
+  "LP" = "v41712900", #Labour productivity
+  "CP" = "v41712917", #Capital productivity
+  "CSI" = "v41713138", #Combined labour and capital inputs
+  "LI" = "v41712951", #Labour input
+  "CI" = "v41713053", #Capital input
+  "LCO" = "v41712985",  #Labour composition
+  "CC" = "v41713087", #Capital composition
+  "LCE" = "v41713172", #Labour compensation
+  "Ccost" = "v41713240" #Capitial Cost
+  ) , 
+  start_time = "1961-01-01" ) %>% 
+  normalize_cansim_values( replacement_value = FALSE) %>% 
+  dplyr::select( Date, VALUE, label) %>%
+  spread( label, VALUE) %>% 
+# Calculate GDP Price Index/Deflator (base = 2012)
+  mutate( Deflator = Nominal / Real ) %>% 
+  mutate( Deflator = Deflator / Deflator [Date == "2012-01-01"] * 100 ) %>% 
+  drop_na( Deflator )
+
+#Examples for Agriculture, forestry, fishing and hunting industry
+AFFH = get_cansim_vector( c( 
+  "Real" = "v86718742",
+  "Nominal" = "v86719264",
+  "MP" = "v41712882", #Multifactor productivity  for Argriculture* (same as following)
+  "LP" = "v41712899", #Labour productivity
+  "CP" = "v41712916", #Capital productivity
+  "CSI" = "v41713137", #Combined labour and capital inputs
+  "LI" = "v41712950", #Labour input
+  "CI" = "v41713052", #Capital input
+  "LCO" = "v41712984",  #Labour composition
+  "CC" = "v41713086", #Capital composition
+  "LCE" = "v41713171", #Labour compensation
+  "Ccost" = "v41713239" #Capitial Cost
+  ) , 
+  start_time = "1961-01-01" ) %>% 
+  normalize_cansim_values( replacement_value = FALSE) %>% 
+  dplyr::select( Date, VALUE, label) %>%
+  spread( label, VALUE) %>% 
+# Calculate GDP Price Index/Deflator (base = 2012)
+  mutate( Deflator = Nominal / Real ) %>% 
+  mutate( Deflator = Deflator / Deflator [Date == "2012-01-01"] * 100 ) %>% 
+  drop_na( Deflator )
+
+#Examples Manufacturing  industry
+M = get_cansim_vector( c( 
+  "Real" = "v86718755",
+  "Nominal" = "v86719277",
+  "MP" = "v41712886", #Multifactor productivity for Manufactoring industry* (same as following)
+  "LP" = "v41712903", #Labour productivity
+  "CP" = "v41712920", #Capital productivity
+  "CSI" = "v41713141", #Combined labour and capital inputs
+  "LI" = "v41712954", #Labour input
+  "CI" = "v41713056", #Capital input
+  "LCO" = "v41712988",  #Labour composition
+  "CC" = "v41713090", #Capital composition
+  "LCE" = "v41713175", #Labour compensation
+  "Ccost" = "v41713243" #Capitial Cost
+  ) , 
+  start_time = "1961-01-01" ) %>% 
+  normalize_cansim_values( replacement_value = FALSE) %>% 
+  dplyr::select( Date, VALUE, label) %>%
+  spread( label, VALUE) %>% 
+# Calculate GDP Price Index/Deflator (base = 2012)
+  mutate( Deflator = Nominal / Real ) %>% 
+  mutate( Deflator = Deflator / Deflator [Date == "2012-01-01"] * 100 ) %>% 
+  drop_na( Deflator )
+```
+---===Oil industry===---
+===trainning===
+```{r,warning=FALSE}
+#external resource
+external = get_external(Oil)
+
+#Auto selection Approach A returns "Ccost" "CI"    "CP"    "LI"    "LP" 
+auto_external(Oil, c("CC","Ccost","CI","CP","CSI", "LCE", "LCO", "LI", "LP", "MP"), df=TRUE)
+
+#Auto selection Approach B returns "Ccost" "CI"    "LI"    "LP"    "MP"
+auto_external_lm(Oil, c("CC","Ccost","CI","CP","CSI", "LCE", "LCO", "LI", "LP", "MP"),df = TRUE)
+
+#Retrain the model with selected xreg
+model_origin <- auto.arima(Oil$Deflator) 
+model_all <- auto.arima(Oil$Deflator, xreg=external)
+model_Approach_a <- auto.arima(Oil$Deflator, xreg=cbind(Oil$Ccost, Oil$CI, Oil$CP, Oil$LI, Oil$LP))
+model_Approach_b <- auto.arima(Oil$Deflator, xreg=cbind(Oil$Ccost, Oil$CI, Oil$LI, Oil$LP, Oil$MP))
+```
+===validation===
+```{r}
+summary(model_origin) ;sep()#AIC 417.36 BIC 427.3 ARIMA(2,1,2)
+summary(model_all) ;sep()#AIC 333.29 BIC 359.39 ARIMA(2,0,0)
+summary(model_Approach_a) ;sep()#arima->lm AIC 338.09 BIC=358.16 ARIMA(2,0,1)
+summary(model_Approach_b) ;sep()#lm->arima AIC 339.46 BIC=359.53 ARIMA(2,0,1)
+
+#Residual
+sum(abs(model_origin$residuals)) #328.4649
+sum(abs(model_all$residuals)) #164.1758
+sum(abs(model_Approach_a$residuals))#188.1708
+sum(abs(model_Approach_b$residuals))#190.245
+
+#Cross validation
+error_origin = tsCV_param(Oil$Deflator, param = c(2,1,2))
+error_full <- get_error(tsCV(Oil$Deflator, fc, xreg = external) , Oil$Deflator) #unstable
+error_Approach_a = tsCV_param(Oil$Deflator, param = c(2,0,1), xreg=cbind(Oil$Ccost, Oil$CI, Oil$CP, Oil$LI, Oil$LP))
+error_Approach_b = tsCV_param(Oil$Deflator, param = c(2,0,1), xreg=cbind(Oil$Ccost, Oil$CI, Oil$LI, Oil$LP, Oil$MP))
+
+#MSPE
+error_origin[1]  #[1] 132.9285464 
+error_full[1] #[1] 96.3871840
+error_Approach_a[1] #[1] 43.51784687
+error_Approach_b[1] #[1] 49.57473
+
+#MAPE
+error_origin[2] #[1] 0.1282342
+error_full[2] #[1] 0.1176507
+error_Approach_a[2] #[1] 0.09371078
+error_Approach_b[2] #[1] 0.09428298
+```
+
+---===Agriculture insudtry===---
+===training===
+```{r,warning=FALSE}
+#external resource
+external = get_external(AFFH)
+
+#Auto selection Approach A returns "CC"  "LCE" "LCO" "LI" 
+auto_external(AFFH, c("CC","Ccost","CI","CP","CSI", "LCE", "LCO", "LI", "LP", "MP"), df=TRUE)
+
+#Auto selection Approach B returns "LCE" "LCO" "LI"  "MP"
+auto_external_lm(AFFH, c("CC","Ccost","CI","CP","CSI", "LCE", "LCO", "LI", "LP", "MP"), df=TRUE)
+
+#Retrain the model with selected xreg
+model_origin <- auto.arima(AFFH$Deflator, include.mean = TRUE) 
+model_all <- auto.arima(AFFH$Deflator, xreg=external)
+model_Approach_a <- auto.arima(AFFH$Deflator, xreg=cbind(AFFH$LCE, AFFH$LCO, AFFH$LI, AFFH$CC))
+model_Approach_b <- auto.arima(AFFH$Deflator, xreg=cbind(AFFH$LCE, AFFH$LCO, AFFH$LI, AFFH$MP))
+```
+===validation===
+```{r}
+summary(model_origin) ;sep()#AIC 339.75  BIC 347.71 ARIMA(2,1,0)
+summary(model_all) ;sep()#AIC 342.14 BIC 366.23 ARIMA(0,0,1)
+summary(model_Approach_a) ;sep()#arima->lm AIC 332.57 BIC=348.63 ARIMA(0,0,2)
+summary(model_Approach_b) ;sep()#lm->arima AIC 344.96 BIC=357 ARIMA(1,0,0)
+
+#Residual
+sum(abs(model_origin$residuals)) #212.8212
+sum(abs(model_all$residuals)) #192.3395
+sum(abs(model_Approach_a$residuals))#166.0736
+sum(abs(model_Approach_b$residuals))#208.4591
+
+#Cross validation
+error_origin = tsCV_param(AFFH$Deflator, param = c(2,1,0))
+error_full <- get_error(tsCV(AFFH$Deflator, fc, xreg = external), AFFH$Deflator) #unstable
+error_Approach_a = get_error(tsCV(AFFH$Deflator, fc, xreg=cbind(AFFH$LCE, AFFH$LCO, AFFH$LI, AFFH$CC)), AFFH$Deflator) #unstable
+error_Approach_b = tsCV_param(AFFH$Deflator, param = c(1,0,0), xreg=cbind(AFFH$LCE, AFFH$LCO, AFFH$LI, AFFH$MP))
+
+
+#MSPE
+error_origin[1]  #[1] 36.69845
+error_full[1] #[1] 102.7845
+error_Approach_a[1] #[1] 41.25409
+error_Approach_b[1] #[1] 39.66413
+
+#MAPE
+error_origin[2] #[1] 0.07913582
+error_full[2] #[1] 0.1342035
+error_Approach_a[2] #[1] 0.08737459
+error_Approach_b[2] #[1] 0.07912079
+```
+
+---===Manufacture industry===---
+===training===
+```{r,warning=FALSE}
+#external resource
+external = get_external(M)
+
+#Auto selection Approach A returns "Ccost" "CI"    "CSI"   "LP"    "MP" 
+auto_external(M, c("CC","Ccost","CI","CP","CSI", "LCE", "LCO", "LI", "LP", "MP"), df = TRUE)
+
+#Auto selection Approach B returns "Ccost" "CI"    "CSI"   "LCE"   "LP"    "MP"
+auto_external_lm(M, c("CC","Ccost","CI","CP","CSI", "LCE", "LCO", "LI", "LP", "MP"), df = TRUE)
+
+#Retrain the model with selected xreg
+model_origin <- auto.arima(M$Deflator) 
+model_all <- auto.arima(M$Deflator, xreg=external)
+model_Approach_a <- auto.arima(M$Deflator, xreg=cbind(M$Ccost, M$CI, M$CSI, M$LP, M$MP))
+model_Approach_b <- auto.arima(M$Deflator, xreg=cbind(M$Ccost, M$CI, M$CSI, M$LCE, M$LP, M$MP))
+```
+===validation===
+```{r}
+summary(model_origin) ;sep()#AIC 218.15  BIC 224.12 ARIMA(1,1,0)
+summary(model_all) ;sep()#AIC 225.32 BIC 251.42 ARIMA(1,0,0)
+summary(model_Approach_a) ;sep()#arima->lm AIC 271.57 BIC 291.64 ARIMA(0,0,3)
+summary(model_Approach_b) ;sep()#lm->arima AIC 264.06 BIC 286.14 ARIMA(0,0,3)
+
+#Residual
+sum(abs(model_origin$residuals)) #76.2154
+sum(abs(model_all$residuals)) #65.17737
+sum(abs(model_Approach_a$residuals))#97.67565
+sum(abs(model_Approach_b$residuals))#88.81551
+
+#Cross validation
+error_origin = tsCV_param(M$Deflator, param = c(1,1,0))
+error_full = tsCV_param(M$Deflator, param = c(1,0,0), xreg = external)
+error_Approach_a = get_error(tsCV(M$Deflator, fc, xreg=cbind(M$Ccost, M$CI, M$CSI, M$LP, M$MP)), M$Deflator)
+error_Approach_b = get_error(tsCV(M$Deflator, fc, xreg = cbind(M$Ccost, M$CI, M$CSI, M$LCE,M$LP, M$MP)), M$Deflator)
+
+#MSPE
+error_origin[1]  #[1] 3.514519
+error_full[1] #[1] 9.459617
+error_Approach_a[1] #[1] 7.958426
+error_Approach_b[1] #[1] 6.432225
+
+#MAPE
+error_origin[2] #[1] 0.02338611
+error_full[2] #[1] 0.03767288
+error_Approach_a[2] #[1] 0.0345886
+error_Approach_b[2] #[1] 0.02988821
+```
